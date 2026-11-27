@@ -1,48 +1,50 @@
+import numpy as np
 import pandas as pd
+import torch
 
 
-def load_ratings(path="data/ml-1m/ratings.dat"):
-    return pd.read_csv(path, sep="::", engine="python",
-                       names=["user", "item", "rating", "timestamp"])
+def build_eval_set(eval_df, exclude_dfs, n_items, n_neg=99, seed=42):
+    """For each user: [positive item] + n_neg random items the user never interacted with.
+    Positive is always at index 0. Call once, reuse for every model."""
+    rng = np.random.default_rng(seed)
+    all_df = pd.concat([eval_df] + list(exclude_dfs))
+    seen = all_df.groupby("user")["item"].apply(set).to_dict()
+
+    users, cands = [], []
+    for u, pos in zip(eval_df["user"], eval_df["item"]):
+        negs = set()
+        while len(negs) < n_neg:
+            j = int(rng.integers(n_items))
+            if j not in seen[u]:
+                negs.add(j)
+        users.append(u)
+        cands.append([pos] + sorted(negs))
+    return np.array(users), np.array(cands)
 
 
-def make_implicit(df, threshold=4):
-    """Keep only ratings >= threshold as positive interactions."""
-    df = df[df["rating"] >= threshold]
-    return df[["user", "item", "timestamp"]].copy()
+@torch.no_grad()
+def evaluate(model, users, cands, k=10, device="cpu"):
+    """Returns (Recall@K, NDCG@K). Works with any model: model(user_ids, item_ids) -> scores."""
+    model.eval()
+    n, c = cands.shape
+    u = torch.as_tensor(users).repeat_interleave(c).to(device)
+    i = torch.as_tensor(cands).reshape(-1).to(device)
+    scores = model(u, i).reshape(n, c)
 
-
-def remap_ids(df):
-    """Turn user/item IDs into 0..N-1 so embeddings can use them."""
-    user_map = {u: i for i, u in enumerate(sorted(df["user"].unique()))}
-    item_map = {m: i for i, m in enumerate(sorted(df["item"].unique()))}
-    df = df.copy()
-    df["user"] = df["user"].map(user_map)
-    df["item"] = df["item"].map(item_map)
-    return df, len(user_map), len(item_map)
-
-
-def leave_one_out_split(df):
-    """Per user: latest interaction -> test, second latest -> validation, rest -> train."""
-    df = df.sort_values(["user", "timestamp"])
-    order = df.groupby("user").cumcount(ascending=False)  # 0 = latest
-    test = df[order == 0]
-    val = df[order == 1]
-    train = df[order >= 2]
-    return train, val, test
-
-
-def prepare_data(path="data/ml-1m/ratings.dat", threshold=4):
-    df = make_implicit(load_ratings(path), threshold)
-    # drop users with fewer than 3 positives (cannot fill train/val/test)
-    counts = df["user"].value_counts()
-    df = df[df["user"].isin(counts[counts >= 3].index)]
-    df, n_users, n_items = remap_ids(df)
-    train, val, test = leave_one_out_split(df)
-    return train, val, test, n_users, n_items
+    # rank of the positive = how many negatives score >= it (0 = best)
+    rank = (scores[:, 1:] >= scores[:, :1]).sum(dim=1)
+    hit = (rank < k).float()
+    recall = hit.mean().item()
+    ndcg = (hit / torch.log2(rank.float() + 2)).mean().item()
+    return recall, ndcg
 
 
 if __name__ == "__main__":
+    from preprocessing import prepare_data
+    from mlp import MLP
+
     train, val, test, n_users, n_items = prepare_data()
-    print("users:", n_users, "items:", n_items)
-    print("train:", len(train), "val:", len(val), "test:", len(test))
+    users, cands = build_eval_set(val, [train], n_items)
+    model = MLP(n_users, n_items)          # untrained model
+    r, n = evaluate(model, users, cands, k=10)
+    print(f"Untrained MLP  Recall@10={r:.4f}  NDCG@10={n:.4f}")
